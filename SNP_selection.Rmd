@@ -1,0 +1,140 @@
+---
+title: "SNP_selection"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ape)
+library(rhdf5)
+options(stringsAsFactors = F)
+```
+
+
+
+```{r data}
+maf.thrs <- 0.05
+promoter.length <- 10000
+#gene.category <- tibble(gene = c('AT5G10140', 'AT5G45830'), category = c('GxT', 'GxT'))
+gene.category <- read_delim('/scratch-cbe/users/pieter.clauw/transcriptome/gwas/Category_genes.txt', delim = '\t')
+araport11<- read.gff('/groups/nordborg/user/pieter.clauw/Documents/Source/Araport11/Araport11_GFF3_genes_transposons.201606.gff')
+chr_regions <- h5readAttributes('/groups/nordborg/user/pieter.clauw/Documents/Source/genotypes_for_pygwas/1.0.0/1001genomes_R_compatible/all_chromosomes_binary_gzip_attrs.hdf5', '/positions')$chr_regions
+
+G.file <- '/groups/nordborg/user/pieter.clauw/Documents/Source/genotypes_for_pygwas/1.0.0/1001genomes_R_compatible/all_chromosomes_binary_gzip_attrs.hdf5'
+chr_regions <- h5readAttributes(G.file, '/positions')$chr_regions
+
+G.output.h5 <- '/groups/nordborg/user/pieter.clauw/Documents/Source/genotypes_for_pygwas/1.0.0/1001genomes_R_compatible/all_chromosomes_binary_gzip_attrs_subsetTEST.hdf5'
+```
+
+
+```{r select genes}
+gene.selection <- filter(gene.category, category == 'GxT') %>%
+  pull(genes)
+
+```
+
+
+```{r gene coordinates}
+gene.selection.coord <- as_tibble(araport11) %>%
+  filter(type == 'gene') %>%
+  separate(attributes, sep = ';', into = 'ID', extra = 'drop') %>%
+  mutate(ID = substr(ID, 4, 12)) %>%
+  filter(ID %in% gene.selection)
+```
+
+```{r snp selection}
+accessions<- h5read(G.file, '/accessions')
+  
+snp.selection.lst <- lapply(gene.selection.coord$ID, function(ID){
+  chr <- as.numeric(substr(gene.selection.coord$seqid[gene.selection.coord$ID == ID], 4, 4))
+  start <- gene.selection.coord$start[gene.selection.coord$ID == ID] - promoter.length
+  end <- gene.selection.coord$end[gene.selection.coord$ID == ID] + promoter.length
+  
+  # if too long due to I/O, make list of 5 elements, with each time the list of positions for one chromosome
+  positions.chr <- h5read(G.file, '/positions', index = list((chr_regions[1,chr] + 1): (chr_regions[2,chr])))
+  snp.idx <- which(positions.chr %in% c(start:end))
+  snp.idx.abs <- snp.idx + chr_regions[1, chr]
+  
+  # select SNP matrix
+  snps.gene <- h5read(G.file, '/snps', index = list(c(1:length(accessions)) ,snp.idx.abs))
+  rownames(snps.gene) <- accessions
+  colnames(snps.gene) <- paste('chr', chr, '_', positions.chr[snp.idx], sep = '')
+  
+  return(snps.gene)
+})
+
+# make one matrix
+snp.selection <- do.call(cbind, snp.selection.lst)
+# throw out duplicate snps
+snp.duplicates <- duplicated(colnames(snp.selection))
+snp.selection <- snp.selection[, !snp.duplicates]
+```
+
+```{r maf selection}
+# calculate minor allele count
+n1 <- colSums(snp.selection)
+mac <- lapply(n1, function(x){min(c(x, nrow(snp.selection) - x))})
+# select snps with allele frequency higher than maf threshold
+mac.thrs <- nrow(snp.selection) * maf.thrs
+snp.mac.sel.idx <- which(mac > mac.thrs)
+snp.selection <- snp.selection[, snp.mac.sel.idx]
+```
+
+
+```{r write snp matrix}
+h5createFile(G.output.h5)
+# adjust all meta information
+
+# accessions
+# no accession selection here, thus stays the same
+h5write(accessions, G.output.h5, '/accessions')
+
+
+# positions
+# list only used positions
+# adjust meta-information (chr_regions, others ?)
+
+
+chr_coord.sort <- c()
+chr.start.pos <- 0
+chr_regions.new <- matrix(data = NA, nrow = 2, ncol = 5)
+for(chr.nr in c(1:5))
+{
+  chr <- paste('chr', chr.nr, sep = '')
+  snps.chr <- colnames(snp.selection)[grepl(chr, colnames(snp.selection))]
+  # sort positions within chromosome
+  if (length(snps.chr) > 0)
+  {
+    snps.chr.order <- order(unlist(lapply(snps.chr, function(x){as.numeric(strsplit(x, '_')[[1]][2])})))
+    chr_coord.sort <- c(chr_coord.sort, snps.chr[snps.chr.order])
+  }
+  # get chr_region
+  num_snps.chr <- length(snps.chr)
+  chr.end.pos <- chr.start.pos + num_snps.chr
+  
+  chr_regions.new[, chr.nr] <- c(chr.start.pos, chr.end.pos)
+  chr.start.pos <- chr.end.pos
+}
+# order columns of SNP matrix
+snp.selection <- snp.selection[, chr_coord.sort]
+positions.new <- unlist(lapply(colnames(snp.selection), function(x){strsplit(x, '_')[[1]][2]}))
+
+attr(positions.new, 'chrs') <- h5readAttributes(G.file, '/positions')$chrs
+attr(positions.new, 'chr_regions') <- chr_regions.new
+h5write(positions.new, G.output.h5, '/positions')
+
+# snps
+snps <- snp.selection
+colnames(snps) <- NULL
+rownames(snps) <- NULL
+
+attr(snps, 'data_format') <- h5readAttributes(G.file, '/snps')$data_format
+attr(snps, 'num_accessions') <- length(accessions)
+attr(snps, 'num_snps') <- ncol(snps)
+h5write(snps, G.output.h5, '/snps')
+h5closeAll()
+```
+
+
+
